@@ -1,15 +1,18 @@
 """Interleaved ratio: blaze chunked-parallel vs Python tiktoken on one long doc.
 Run from the repo root, PLUGGED INTO AC POWER (battery throttles all-core clocks):
-    python3 -c "d=open('data/shakespeare.txt').read(); open('data/big.txt','w').write(d*29)"
     cargo build --release --example hundredx
     python3 scripts/ratio.py
 """
-import subprocess, time, statistics
+import os, subprocess, time, statistics
 
 import tiktoken
 
 BIG = "data/big.txt"
 BIN = "target/release/examples/hundredx"
+
+if not os.path.exists(BIG):
+    d = open("data/shakespeare.txt").read()
+    open(BIG, "w").write(d * 29)
 
 text = open(BIG).read()
 nbytes = len(text.encode())

@@ -39,6 +39,17 @@ const LONG_PIECE: usize = 128;
 const CACHE_BITS: u32 = 18;
 const CACHE_SLOTS: usize = 1 << CACHE_BITS;
 
+/// Long-piece cache: pieces of 17..=96 bytes. Unbroken CJK letter-runs and
+/// long Cyrillic/accented words form pieces above `MAX_CACHED_PIECE`, and
+/// real multilingual text repeats them heavily; without this they re-run the
+/// full merge loop on every occurrence.
+const MAX_LONG_PIECE: usize = 96;
+/// Max token ids stored per long entry (a 96-byte CJK run merges to well
+/// under this; longer expansions are not cached).
+const MAX_LONG_TOKENS: usize = 48;
+const LONG_CACHE_BITS: u32 = 13;
+const LONG_CACHE_SLOTS: usize = 1 << LONG_CACHE_BITS;
+
 /// One slot of the direct-mapped piece cache. The piece bytes (<= 16) are
 /// packed little-endian into `w0`/`w1` (zero-padded); `meta` is
 /// `(piece_len << 8) | n_tokens`, so `meta == 0` means the slot is empty
@@ -61,16 +72,44 @@ const EMPTY_ENTRY: CacheEntry = CacheEntry {
     ids: [0; 6],
 };
 
+/// One slot of the direct-mapped long-piece cache. `len == 0` means empty;
+/// hits verify the full piece bytes, so collisions are correctness-safe.
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct LongEntry {
+    key: [u8; MAX_LONG_PIECE],
+    len: u16,
+    n: u16,
+    ids: [u32; MAX_LONG_TOKENS],
+}
+
+const EMPTY_LONG: LongEntry = LongEntry {
+    key: [0; MAX_LONG_PIECE],
+    len: 0,
+    n: 0,
+    ids: [0; MAX_LONG_TOKENS],
+};
+
 struct PieceCache {
     owner: u64,
     entries: Box<[CacheEntry]>,
+    long: Box<[LongEntry]>,
 }
 
 thread_local! {
     static PIECE_CACHE: RefCell<PieceCache> = RefCell::new(PieceCache {
         owner: 0,
         entries: vec![EMPTY_ENTRY; CACHE_SLOTS].into_boxed_slice(),
+        long: vec![EMPTY_LONG; LONG_CACHE_SLOTS].into_boxed_slice(),
     });
+}
+
+#[inline]
+fn long_hash(piece: &[u8]) -> u64 {
+    use std::hash::Hasher;
+    let mut h = rustc_hash::FxHasher::default();
+    h.write(piece);
+    h.finish()
 }
 
 #[inline]
@@ -438,6 +477,7 @@ impl Tokenizer {
         PIECE_CACHE.with_borrow_mut(|cache| {
             if cache.owner != self.id {
                 cache.entries.fill(EMPTY_ENTRY);
+                cache.long.fill(EMPTY_LONG);
                 cache.owner = self.id;
             }
             let bytes = text.as_bytes();
@@ -490,6 +530,26 @@ impl Tokenizer {
                             meta: ((len << 8) | n) as u32,
                             ids,
                         };
+                    }
+                } else if len <= MAX_LONG_PIECE {
+                    let piece = &bytes[start..end];
+                    let idx =
+                        (long_hash(piece) >> (64 - LONG_CACHE_BITS)) as usize;
+                    // SAFETY: the shift yields < LONG_CACHE_SLOTS == long.len().
+                    let e = unsafe { cache.long.get_unchecked(idx) };
+                    if e.len as usize == len && e.key[..len] == *piece {
+                        out.extend_from_slice(&e.ids[..e.n as usize]);
+                        return;
+                    }
+                    let from = out.len();
+                    self.encode_piece(piece, out);
+                    let n = out.len() - from;
+                    if n <= MAX_LONG_TOKENS {
+                        let e = &mut cache.long[idx];
+                        e.key[..len].copy_from_slice(piece);
+                        e.len = len as u16;
+                        e.n = n as u16;
+                        e.ids[..n].copy_from_slice(&out[from..]);
                     }
                 } else {
                     self.encode_piece(&bytes[start..end], out);

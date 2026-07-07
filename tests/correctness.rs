@@ -202,3 +202,28 @@ fn specials_and_batch() {
     assert!(batch.iter().all(|ids| *ids == batch[0]));
     assert_eq!(ours.decode(&batch[0]).unwrap(), "hello world");
 }
+
+#[test]
+fn long_piece_cache_matches_tiktoken() {
+    let ours = Tokenizer::cl100k_base("data/cl100k_base.tiktoken").unwrap();
+    let reference = tiktoken_rs::cl100k_base().unwrap();
+    let mut cases = Vec::new();
+    // Pieces of 17..=96 bytes hit the long-piece cache; repeat each text so
+    // both the cold (fill) and hot (verified hit) paths run, and step CJK run
+    // lengths across the 96-byte cache limit and the 128-byte heap threshold.
+    for reps in 1..=16 {
+        let cjk = "统一码万国码单一".repeat(reps);
+        cases.push(format!("{cjk} and {cjk}, {cjk}."));
+    }
+    cases.push(
+        "日本語のテキストを処理する速度を測定します。中文分词的速度也很重要。\
+         Скорость токенизации русского текста. सटीक और तेज़ टोकनाइज़ेशन। "
+            .repeat(50),
+    );
+    // Same slot reused by different pieces: byte verification must reject
+    // collisions and stale entries.
+    for w in ["Скорость", "токенизации", "русского"] {
+        cases.push(w.repeat(3).repeat(4));
+    }
+    compare(&ours, &reference, &cases);
+}

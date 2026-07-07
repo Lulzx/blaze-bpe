@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2021"
 description = "Fast tiktoken-compatible BPE tokenizer"
 license = "MIT"
+repository = "https://github.com/Lulzx/blaze-bpe"
+readme = "README.md"
+keywords = ["tokenizer", "bpe", "tiktoken", "nlp", "simd"]
+categories = ["text-processing", "algorithms"]
 
 [dependencies]
 rustc-hash = "2"
