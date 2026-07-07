@@ -125,6 +125,35 @@ cargo run --release --example compare    # throughput comparison table
 cargo bench                              # criterion benchmarks
 ```
 
+## How it works
+
+BPE tokenization is a two-stage pipeline, and blaze-bpe reimplements both
+stages from scratch while reproducing tiktoken's semantics exactly:
+
+1. **Pre-tokenization.** The input is split into *pieces* — words,
+   contractions, number runs, punctuation clusters, whitespace runs —
+   according to the cl100k/o200k splitting pattern. tiktoken does this with a
+   backtracking regex engine; blaze-bpe implements the same splitting rules
+   as a hand-written scanner (`src/scan.rs`), SIMD-accelerated on aarch64.
+   Pieces never span this boundary, which is also what makes safe parallel
+   chunking possible.
+
+2. **BPE merge.** Each piece starts as a sequence of single bytes, and the
+   lowest-ranked adjacent pair (per the vocab's merge ranks) is repeatedly
+   merged until no adjacent pair exists in the vocab. Ranks equal token ids,
+   so the final sequence of merged spans *is* the token ids. Before merging,
+   each piece is looked up in per-thread caches — most words in real text
+   repeat, so the merge loop only runs for genuinely novel pieces.
+
+Special tokens (`encode_with_specials`) are found with an Aho-Corasick pass
+that splits the text around them; everything between is encoded normally.
+Decoding is a table lookup: each id maps back to its byte sequence, which are
+concatenated and UTF-8-validated (`decode_bytes` skips validation).
+
+Inputs above ~384KB are transparently split at provably piece-safe boundaries
+and encoded on all cores (`encode`); `encode_batch` parallelizes over
+documents instead. Both produce byte-identical output to sequential encoding.
+
 ## Why it's fast
 
 1. **Bitmask pre-tokenization scanner** (`src/scan.rs`). tiktoken spends
