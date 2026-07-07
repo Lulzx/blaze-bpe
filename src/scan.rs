@@ -108,17 +108,46 @@ fn contraction_suffix(b: &[u8], j: usize) -> Option<usize> {
     }
 }
 
+/// Advance `e` past ASCII letters (A-Z, a-z), 16 bytes at a time on aarch64.
+/// `OR_CASE` folds case before the range test; with it false only a-z match.
+#[inline]
+fn ascii_run<const OR_CASE: bool>(b: &[u8], mut e: usize) -> usize {
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        use std::arch::aarch64::*;
+        while e + 16 <= b.len() {
+            let mut v = vld1q_u8(b.as_ptr().add(e));
+            if OR_CASE {
+                v = vorrq_u8(v, vdupq_n_u8(0x20));
+            }
+            let is_letter = vcltq_u8(vsubq_u8(v, vdupq_n_u8(b'a')), vdupq_n_u8(26));
+            // Narrowing-shift movemask: 4 mask bits per byte lane.
+            let m = vshrn_n_u16(vreinterpretq_u16_u8(is_letter), 4);
+            let mask = vget_lane_u64(vreinterpret_u64_u8(m), 0);
+            if mask == u64::MAX {
+                e += 16;
+                continue;
+            }
+            return e + ((!mask).trailing_zeros() as usize >> 2);
+        }
+    }
+    while e < b.len() {
+        let c = if OR_CASE { b[e] | 0x20 } else { b[e] };
+        if c.wrapping_sub(b'a') >= 26 {
+            break;
+        }
+        e += 1;
+    }
+    e
+}
+
 /// Consume `\p{L}+` starting at byte `e`.
 #[inline]
 fn scan_letters(s: &str, mut e: usize) -> usize {
     let b = s.as_bytes();
     let n = b.len();
     loop {
-        // ASCII letter fast loop: (c | 0x20) maps A-Z to a-z; anything >= 0x80
-        // stays >= 0x80 and fails the range check.
-        while e < n && (b[e] | 0x20).wrapping_sub(b'a') < 26 {
-            e += 1;
-        }
+        e = ascii_run::<true>(b, e);
         if e >= n || b[e] < 0x80 {
             return e;
         }
@@ -241,6 +270,17 @@ fn scan_digits(s: &str, i: usize, l0: usize) -> usize {
 /// Find the end of the piece starting at byte `i` of `s` (cl100k pattern).
 pub fn next_piece_cl100k(s: &str, i: usize) -> usize {
     let n = s.len();
+    let b = s.as_bytes();
+    // Fast paths for the two dominant piece shapes; exact per the pattern:
+    // an ASCII letter can only start alt 2 (alt 1 needs `'`), and a space
+    // followed by an ASCII letter can only match alt 2's optional prefix.
+    let c = b[i];
+    if (c | 0x20).wrapping_sub(b'a') < 26 {
+        return scan_letters(s, i + 1);
+    }
+    if c == b' ' && i + 1 < n && (b[i + 1] | 0x20).wrapping_sub(b'a') < 26 {
+        return scan_letters(s, i + 2);
+    }
     let (c0, l0) = char_at(s, i);
     let k0 = class_of(c0);
 
@@ -374,37 +414,48 @@ fn o200k_word(
     Some(end)
 }
 
+/// Greedy `B+` continuation from `e` plus optional contraction suffix
+/// (o200k alt 1 with empty `A*`).
+#[inline]
+fn o200k_lower_run(s: &str, mut e: usize) -> usize {
+    let b = s.as_bytes();
+    let n = s.len();
+    loop {
+        e = ascii_run::<false>(b, e);
+        if e >= n || b[e] < 0x80 {
+            break;
+        }
+        let (c, l) = char_at(s, e);
+        if class_of(c) & LC == 0 {
+            break;
+        }
+        e += l;
+    }
+    if e < n && b[e] == b'\'' {
+        if let Some(e2) = contraction_suffix(b, e + 1) {
+            return e2;
+        }
+    }
+    e
+}
+
 /// Find the end of the piece starting at byte `i` of `s` (o200k pattern).
 pub fn next_piece_o200k(s: &str, i: usize) -> usize {
+    // Fast path: space followed by an ASCII lowercase letter can only match
+    // alt 1 with the space as prefix and empty A*.
+    {
+        let b = s.as_bytes();
+        if b[i] == b' ' && i + 1 < s.len() && b[i + 1].wrapping_sub(b'a') < 26 {
+            return o200k_lower_run(s, i + 2);
+        }
+    }
     let (c0, l0) = char_at(s, i);
     let k0 = class_of(c0);
 
     // Fast path: lowercase-ish start (the overwhelmingly common case) can
     // only match alt 1 with empty prefix and empty A*.
     if k0 & LC != 0 && k0 & UC == 0 {
-        let b = s.as_bytes();
-        let n = s.len();
-        let mut e = i + l0;
-        loop {
-            // ASCII lowercase fast loop.
-            while e < n && b[e].wrapping_sub(b'a') < 26 {
-                e += 1;
-            }
-            if e >= n || b[e] < 0x80 {
-                break;
-            }
-            let (c, l) = char_at(s, e);
-            if class_of(c) & LC == 0 {
-                break;
-            }
-            e += l;
-        }
-        if e < n && b[e] == b'\'' {
-            if let Some(e2) = contraction_suffix(b, e + 1) {
-                return e2;
-            }
-        }
-        return e;
+        return o200k_lower_run(s, i + l0);
     }
 
     // Alt 1 then Alt 2 (word forms).

@@ -25,61 +25,47 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 const RANK_NONE: u32 = u32::MAX;
 /// Target chunk size for parallel encoding of a single long document.
-const CHUNK_TARGET: usize = 128 * 1024;
+const CHUNK_TARGET: usize = 192 * 1024;
 /// `encode` switches to chunked-parallel encoding at this input size.
 const PARALLEL_THRESHOLD: usize = 2 * CHUNK_TARGET;
 
 static NEXT_TOKENIZER_ID: AtomicU64 = AtomicU64::new(1);
 
-/// Piece cache: hash-keyed FxHashMap with the piece bytes stored inline in
-/// the entry for exact verification (no pointer chase, no allocation per
-/// insert). A full-hash collision simply reads as a miss.
-const SLOT_KEY_LEN: usize = 20;
-const SLOT_IDS: usize = 6;
-/// Entry cap per thread; the cache is cleared when exceeded.
+
+const MAX_CACHED_PIECE: usize = 16;
 const CACHE_CAP: usize = 1 << 16;
 
-#[derive(Clone, Copy)]
-struct CacheEntry {
+type TokenIds = SmallVec<[u32; 6]>;
+
+/// A piece of <= 16 bytes packed into two words plus its length, so hashing
+/// is two fixed multiply rounds and equality is two integer compares --
+/// no pointer chase, no memcmp, no per-insert allocation. `len` disambiguates
+/// zero-padding from literal NUL bytes in a piece.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct PieceKey {
+    w0: u64,
+    w1: u64,
     len: u8,
-    n_ids: u8,
-    key: [u8; SLOT_KEY_LEN],
-    ids: [u32; SLOT_IDS],
 }
 
-struct PieceCache {
-    owner: u64,
-    map: FxHashMap<u64, CacheEntry>,
-}
-
-impl PieceCache {
+impl std::hash::Hash for PieceKey {
     #[inline]
-    fn get(&self, piece: &[u8], h: u64) -> Option<&[u32]> {
-        let e = self.map.get(&h)?;
-        if e.len as usize == piece.len() && e.key[..piece.len()] == *piece {
-            Some(&e.ids[..e.n_ids as usize])
-        } else {
-            None
-        }
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        state.write_u64(self.w0 ^ (self.len as u64).rotate_left(57));
+        state.write_u64(self.w1);
     }
+}
 
+impl PieceKey {
     #[inline]
-    fn insert(&mut self, piece: &[u8], h: u64, ids: &[u32]) {
-        if ids.len() > SLOT_IDS {
-            return;
-        }
-        if self.map.len() >= CACHE_CAP {
-            self.map.clear();
-        }
-        let mut e = CacheEntry {
+    fn new(piece: &[u8]) -> Self {
+        debug_assert!(piece.len() <= 16);
+        let (a, b) = piece.split_at(piece.len().min(8));
+        PieceKey {
+            w0: read_u64_padded(a),
+            w1: read_u64_padded(b),
             len: piece.len() as u8,
-            n_ids: ids.len() as u8,
-            key: [0; SLOT_KEY_LEN],
-            ids: [0; SLOT_IDS],
-        };
-        e.key[..piece.len()].copy_from_slice(piece);
-        e.ids[..ids.len()].copy_from_slice(ids);
-        self.map.insert(h, e);
+        }
     }
 }
 
@@ -91,16 +77,9 @@ fn read_u64_padded(b: &[u8]) -> u64 {
     u64::from_le_bytes(buf)
 }
 
-/// Cheap multiply-mix hash over <= SLOT_KEY_LEN bytes.
-#[inline]
-fn hash_piece(b: &[u8]) -> u64 {
-    const K: u64 = 0x9E37_79B9_7F4A_7C15;
-    let mut h = (b.len() as u64).wrapping_mul(K);
-    for chunk in b.chunks(8) {
-        h = (h ^ read_u64_padded(chunk)).wrapping_mul(K);
-        h ^= h >> 29;
-    }
-    h
+struct PieceCache {
+    owner: u64,
+    map: FxHashMap<PieceKey, TokenIds>,
 }
 
 thread_local! {
@@ -280,7 +259,7 @@ impl Tokenizer {
 
     /// Encode on the calling thread only, regardless of input size.
     pub fn encode_sequential(&self, text: &str) -> Vec<u32> {
-        let mut out = Vec::with_capacity(text.len() / 4 + 8);
+        let mut out = Vec::with_capacity(text.len() / 3 + 16);
         self.encode_ordinary_into(text, &mut out);
         out
     }
@@ -306,16 +285,27 @@ impl Tokenizer {
             .par_windows(2)
             .map(|w| self.encode_sequential(&text[w[0]..w[1]]))
             .collect();
-        let mut out = Vec::with_capacity(parts.iter().map(Vec::len).sum());
+        // Parallel concat: copy each part into its precomputed offset of the
+        // output buffer. Regions are disjoint by construction.
+        let total: usize = parts.iter().map(Vec::len).sum();
+        let mut offsets = Vec::with_capacity(parts.len());
+        let mut acc = 0usize;
         for p in &parts {
-            out.extend_from_slice(p);
+            offsets.push(acc);
+            acc += p.len();
         }
+        let mut out: Vec<u32> = Vec::with_capacity(total);
+        let base = out.as_mut_ptr() as usize;
+        parts.par_iter().zip(offsets).for_each(|(p, off)| unsafe {
+            std::ptr::copy_nonoverlapping(p.as_ptr(), (base as *mut u32).add(off), p.len());
+        });
+        unsafe { out.set_len(total) };
         out
     }
 
     /// Encode text, mapping registered special-token strings to their ids.
     pub fn encode_with_specials(&self, text: &str) -> Vec<u32> {
-        let mut out = Vec::with_capacity(text.len() / 4 + 8);
+        let mut out = Vec::with_capacity(text.len() / 3 + 16);
         let Some(ac) = &self.special_ac else {
             self.encode_ordinary_into(text, &mut out);
             return out;
@@ -379,15 +369,20 @@ impl Tokenizer {
                     out.push(self.byte_token[piece[0] as usize]);
                     return;
                 }
-                if piece.len() <= SLOT_KEY_LEN {
-                    let h = hash_piece(piece);
-                    if let Some(ids) = cache.get(piece, h) {
+                if piece.len() <= MAX_CACHED_PIECE {
+                    let key = PieceKey::new(piece);
+                    if let Some(ids) = cache.map.get(&key) {
                         out.extend_from_slice(ids);
                         return;
                     }
                     let from = out.len();
                     self.encode_piece(piece, out);
-                    cache.insert(piece, h, &out[from..]);
+                    if cache.map.len() >= CACHE_CAP {
+                        cache.map.clear();
+                    }
+                    if out.len() - from <= 6 {
+                        cache.map.insert(key, TokenIds::from_slice(&out[from..]));
+                    }
                 } else {
                     self.encode_piece(piece, out);
                 }
