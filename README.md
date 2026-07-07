@@ -42,11 +42,12 @@ Chunked-parallel single document: 1180 MB/s (1.1 MB), ~2000 MB/s (32 MB).
 
 ### vs Python tiktoken on one long document (32 MB, cl100k)
 
-Interleaved measurement (`python3 scripts/ratio.py`), identical token output:
-tiktoken ~20-21 MB/s single-thread; blaze chunked-parallel ~2000-2050 MB/s on
-AC power (**~98-100x**, best round 100.3x), ~1700-1900 MB/s on battery power
-(~85-90x — macOS reduces all-core sustained clocks when discharging).
-Measure plugged in.
+Interleaved measurement (`python3 scripts/ratio.py`), identical token output,
+M4 Pro (8P+4E): tiktoken ~21 MB/s single-thread; blaze chunked-parallel
+**~4.2 GB/s (~198x)**, warm sequential ~575 MB/s. Battery power throttles
+all-core clocks; measure plugged in. Per-regime single-thread numbers
+(`cargo run --release --example regimes`): cold/novel ~215 MB/s, warm/repeat
+~575 MB/s, unbroken CJK ~90 MB/s.
 
 Reproduce with:
 
@@ -58,28 +59,35 @@ cargo bench                              # criterion benchmarks
 
 ## Why it's fast
 
-1. **Hand-rolled pre-tokenization scanner** (`src/scan.rs`). tiktoken spends
+1. **Bitmask pre-tokenization scanner** (`src/scan.rs`). tiktoken spends
    most of its time in `fancy_regex`, a backtracking regex engine. We
    implement the exact splitting semantics of the cl100k/o200k patterns
-   (ordered alternation, possessive quantifiers, greedy backtracking) as a
-   direct byte-level scanner with table-driven character classes; non-ASCII
-   falls back to a Unicode general-category lookup. Letter runs (the dominant
-   piece shape) are scanned 16 bytes per iteration with NEON on aarch64 via
-   the narrowing-shift movemask trick.
+   (ordered alternation, possessive quantifiers, greedy backtracking)
+   directly. On aarch64, cl100k classifies 64 bytes at a time with NEON into
+   1-bit-per-byte class masks (letter/digit/newline/whitespace/non-ASCII);
+   piece boundaries then come from shift + count-trailing-zeros instead of
+   per-byte branches. A "pure lane" emits `word (space word)*` runs — the
+   dominant shape in real text — at one ctz per piece with zero dispatch
+   branches. Non-ASCII, contractions and window boundaries fall back to an
+   exact scalar scanner with table-driven character classes.
 
 2. **Id-pair merge table.** At load time we precompute
    `(left_id, right_id) -> merged_id` for every token splittable into two
    existing tokens. The merge loop then hashes a single `u64` per candidate
    pair instead of re-hashing byte slices like tiktoken's
    `ranks.get(&piece[start..end])`. Merge priority equals the merged token id,
-   so greedy lowest-rank merging reproduces tiktoken exactly.
+   so greedy lowest-rank merging reproduces tiktoken exactly. Pieces longer
+   than 128 bytes (unbroken CJK) switch from the O(n²) scan-for-min loop to a
+   heap-based O(n log n) merge — ~11x on CJK.
 
-3. **Thread-local piece cache.** Real text repeats words heavily. Pieces up
-   to 16 bytes are packed into a fixed two-word inline key (two multiply
-   rounds to hash, two integer compares for equality, no allocation) and
-   cached per thread, so repeated words skip BPE merging entirely. This is
-   the big win on long prompts and repeated encoding — exactly the LLM
-   serving workload.
+3. **Direct-mapped piece caches.** Real text repeats words heavily. Pieces up
+   to 16 bytes are packed into two words by a single unaligned 16-byte load
+   plus branchless masking; a cache hit is one indexed load, three integer
+   compares and a fixed 24-byte copy — no probing, no allocation. Each thread
+   has an adaptive direct-mapped cache (2^18 × 48B slots), seeded on miss
+   from a shared immutable table prebuilt from the vocab (every vocab token
+   ≤ 16 bytes is a guaranteed single-token piece), so threads start warm and
+   single-token pieces never merge.
 
 4. **Rayon batch encoding** (`encode_batch`), with per-thread caches and no
    shared mutable state.

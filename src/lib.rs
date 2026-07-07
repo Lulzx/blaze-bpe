@@ -35,7 +35,7 @@ static NEXT_TOKENIZER_ID: AtomicU64 = AtomicU64::new(1);
 const MAX_CACHED_PIECE: usize = 16;
 /// Pieces longer than this use the heap-based merge (O(n log n) vs O(n^2)).
 const LONG_PIECE: usize = 128;
-/// log2 of direct-mapped cache slots.
+/// log2 of shared vocab-cache slots (built once at load from the vocab).
 const CACHE_BITS: u32 = 18;
 const CACHE_SLOTS: usize = 1 << CACHE_BITS;
 
@@ -74,10 +74,9 @@ thread_local! {
 }
 
 #[inline]
-fn cache_index(w0: u64, w1: u64, len: usize) -> usize {
-    let h = (w0 ^ w1.rotate_left(29) ^ (len as u64).rotate_left(57))
-        .wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    (h >> (64 - CACHE_BITS)) as usize
+fn cache_hash(w0: u64, w1: u64, len: usize) -> u64 {
+    (w0 ^ w1.rotate_left(29) ^ (len as u64).rotate_left(57))
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
 }
 
 /// Pack piece bytes `[start, start+len)` (2 <= len <= 16) into two
@@ -148,6 +147,12 @@ pub struct Tokenizer {
     pair_table: FxHashMap<u64, u32>,
     specials: FxHashMap<String, u32>,
     special_ac: Option<AhoCorasick>,
+    /// Direct-mapped piece cache prebuilt from the vocab: every regular token
+    /// of 2..=16 bytes is a guaranteed single-token piece. Immutable and
+    /// shared by all threads, so it is warm from the first byte and the
+    /// working set exists once per package instead of once per thread.
+    /// Collisions keep the lower id (roughly: the more frequent token).
+    vocab_cache: Box<[CacheEntry]>,
     /// Reusable chunk-output buffers for `encode_parallel` (avoids a
     /// large-alloc mmap/munmap cycle per chunk per call).
     chunk_buffers: std::sync::Mutex<Vec<Vec<u32>>>,
@@ -216,6 +221,29 @@ impl Tokenizer {
             }
         }
 
+        let mut vocab_cache = vec![EMPTY_ENTRY; CACHE_SLOTS].into_boxed_slice();
+        for (bytes, &id) in &token_map {
+            let len = bytes.len();
+            if !(2..=MAX_CACHED_PIECE).contains(&len) {
+                continue;
+            }
+            let (a, b) = bytes.split_at(len.min(8));
+            let mut buf = [0u8; 16];
+            buf[..a.len()].copy_from_slice(a);
+            buf[8..8 + b.len()].copy_from_slice(b);
+            let w0 = u64::from_le_bytes(buf[..8].try_into().unwrap());
+            let w1 = u64::from_le_bytes(buf[8..].try_into().unwrap());
+            let slot = &mut vocab_cache[(cache_hash(w0, w1, len) >> (64 - CACHE_BITS)) as usize];
+            if slot.meta == 0 || id < slot.ids[0] {
+                *slot = CacheEntry {
+                    w0,
+                    w1,
+                    meta: ((len << 8) | 1) as u32,
+                    ids: [id, 0, 0, 0, 0, 0],
+                };
+            }
+        }
+
         let mut specials = FxHashMap::default();
         for &(s, id) in special_tokens {
             token_bytes[id as usize] = s.as_bytes().into();
@@ -241,6 +269,7 @@ impl Tokenizer {
             pair_table,
             specials,
             special_ac,
+            vocab_cache,
             chunk_buffers: std::sync::Mutex::new(Vec::new()),
         })
     }
@@ -420,8 +449,9 @@ impl Tokenizer {
                 }
                 if len <= MAX_CACHED_PIECE {
                     let (w0, w1) = key_words(bytes, start, len);
-                    let idx = cache_index(w0, w1, len);
-                    // SAFETY: cache_index yields < CACHE_SLOTS == entries.len().
+                    let h = cache_hash(w0, w1, len);
+                    let idx = (h >> (64 - CACHE_BITS)) as usize;
+                    // SAFETY: the shift yields < CACHE_SLOTS == entries.len().
                     let e = unsafe { cache.entries.get_unchecked(idx) };
                     if e.w0 == w0 && e.w1 == w1 && (e.meta >> 8) as usize == len {
                         let n = (e.meta & 0xff) as usize;
@@ -436,6 +466,16 @@ impl Tokenizer {
                             );
                             out.set_len(out.len() + n);
                         }
+                        return;
+                    }
+                    // Miss: seed from the shared vocab cache (single-token
+                    // pieces skip the merge entirely), else merge.
+                    // SAFETY: same shift bound as above; both tables share
+                    // CACHE_SLOTS.
+                    let v = unsafe { self.vocab_cache.get_unchecked(idx) };
+                    if v.w0 == w0 && v.w1 == w1 && (v.meta >> 8) as usize == len {
+                        out.push(v.ids[0]);
+                        cache.entries[idx] = *v;
                         return;
                     }
                     let from = out.len();
