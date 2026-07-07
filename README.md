@@ -54,9 +54,10 @@ cargo bench                              # criterion benchmarks
    most of its time in `fancy_regex`, a backtracking regex engine. We
    implement the exact splitting semantics of the cl100k/o200k patterns
    (ordered alternation, possessive quantifiers, greedy backtracking) as a
-   direct byte-level scanner with an ASCII fast path and table-driven
-   character classes; non-ASCII falls back to a Unicode general-category
-   lookup.
+   direct byte-level scanner with table-driven character classes; non-ASCII
+   falls back to a Unicode general-category lookup. Letter runs (the dominant
+   piece shape) are scanned 16 bytes per iteration with NEON on aarch64 via
+   the narrowing-shift movemask trick.
 
 2. **Id-pair merge table.** At load time we precompute
    `(left_id, right_id) -> merged_id` for every token splittable into two
@@ -66,22 +67,24 @@ cargo bench                              # criterion benchmarks
    so greedy lowest-rank merging reproduces tiktoken exactly.
 
 3. **Thread-local piece cache.** Real text repeats words heavily. Pieces up
-   to 64 bytes are cached per thread (`piece bytes -> token ids`, capped at
-   64K entries), so repeated words skip BPE merging entirely. This is the big
-   win on long prompts and repeated encoding — exactly the LLM serving
-   workload.
+   to 16 bytes are packed into a fixed two-word inline key (two multiply
+   rounds to hash, two integer compares for equality, no allocation) and
+   cached per thread, so repeated words skip BPE merging entirely. This is
+   the big win on long prompts and repeated encoding — exactly the LLM
+   serving workload.
 
 4. **Rayon batch encoding** (`encode_batch`), with per-thread caches and no
    shared mutable state.
 
 5. **Chunked-parallel long documents.** `encode` transparently splits inputs
-   above 256KB into ~128KB chunks and encodes them in parallel. Cuts are only
-   made at positions where a pre-tokenization piece provably ends regardless
-   of scan alignment (after `\n` followed by non-whitespace, or between an
-   ASCII letter and a following space/digit/punct other than `'`), so the
-   result is byte-identical to sequential encoding; `encode_sequential`
-   bypasses this. Inputs with no safe cut (e.g. unbroken CJK) fall back to
-   sequential automatically.
+   above ~384KB into ~192KB chunks, encodes them in parallel, and
+   parallel-copies the parts into the output at precomputed offsets. Cuts are
+   only made at positions where a pre-tokenization piece provably ends
+   regardless of scan alignment (after `\n` followed by non-whitespace, or
+   between an ASCII letter and a following space/digit/punct other than `'`),
+   so the result is byte-identical to sequential encoding;
+   `encode_sequential` bypasses this. Inputs with no safe cut (e.g. unbroken
+   CJK) fall back to sequential automatically.
 
 Merging itself uses tiktoken's neighbor-update algorithm (recompute only the
 two ranks adjacent to a merge) over `SmallVec` stack buffers — pieces are

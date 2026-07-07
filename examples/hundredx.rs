@@ -9,9 +9,10 @@ fn main() {
     let tok = blaze_bpe::Tokenizer::cl100k_base("data/cl100k_base.tiktoken").unwrap();
     let mb = text.len() as f64 / 1e6;
 
+    let iters: usize = std::env::var("ITERS").ok().and_then(|v| v.parse().ok()).unwrap_or(12);
     let mut best = f64::INFINITY;
     let mut ntok = 0;
-    for _ in 0..12 {
+    for _ in 0..iters {
         let t = Instant::now();
         ntok = tok.encode(&text).len();
         best = best.min(t.elapsed().as_secs_f64());
