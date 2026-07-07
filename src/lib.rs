@@ -33,60 +33,83 @@ static NEXT_TOKENIZER_ID: AtomicU64 = AtomicU64::new(1);
 
 
 const MAX_CACHED_PIECE: usize = 16;
-const CACHE_CAP: usize = 1 << 16;
+/// Pieces longer than this use the heap-based merge (O(n log n) vs O(n^2)).
+const LONG_PIECE: usize = 128;
+/// log2 of direct-mapped cache slots.
+const CACHE_BITS: u32 = 18;
+const CACHE_SLOTS: usize = 1 << CACHE_BITS;
 
-type TokenIds = SmallVec<[u32; 6]>;
-
-/// A piece of <= 16 bytes packed into two words plus its length, so hashing
-/// is two fixed multiply rounds and equality is two integer compares --
-/// no pointer chase, no memcmp, no per-insert allocation. `len` disambiguates
-/// zero-padding from literal NUL bytes in a piece.
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct PieceKey {
+/// One slot of the direct-mapped piece cache. The piece bytes (<= 16) are
+/// packed little-endian into `w0`/`w1` (zero-padded); `meta` is
+/// `(piece_len << 8) | n_tokens`, so `meta == 0` means the slot is empty
+/// (valid pieces have len >= 2). Fixed 48-byte entries mean a hit is one
+/// indexed load, three integer compares, and an unconditional 24-byte copy —
+/// no probing, no pointer chase, no allocation.
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct CacheEntry {
     w0: u64,
     w1: u64,
-    len: u8,
+    meta: u32,
+    ids: [u32; 6],
 }
 
-impl std::hash::Hash for PieceKey {
-    #[inline]
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        state.write_u64(self.w0 ^ (self.len as u64).rotate_left(57));
-        state.write_u64(self.w1);
-    }
-}
-
-impl PieceKey {
-    #[inline]
-    fn new(piece: &[u8]) -> Self {
-        debug_assert!(piece.len() <= 16);
-        let (a, b) = piece.split_at(piece.len().min(8));
-        PieceKey {
-            w0: read_u64_padded(a),
-            w1: read_u64_padded(b),
-            len: piece.len() as u8,
-        }
-    }
-}
-
-#[inline]
-fn read_u64_padded(b: &[u8]) -> u64 {
-    debug_assert!(b.len() <= 8);
-    let mut buf = [0u8; 8];
-    buf[..b.len()].copy_from_slice(b);
-    u64::from_le_bytes(buf)
-}
+const EMPTY_ENTRY: CacheEntry = CacheEntry {
+    w0: 0,
+    w1: 0,
+    meta: 0,
+    ids: [0; 6],
+};
 
 struct PieceCache {
     owner: u64,
-    map: FxHashMap<PieceKey, TokenIds>,
+    entries: Box<[CacheEntry]>,
 }
 
 thread_local! {
     static PIECE_CACHE: RefCell<PieceCache> = RefCell::new(PieceCache {
         owner: 0,
-        map: FxHashMap::default(),
+        entries: vec![EMPTY_ENTRY; CACHE_SLOTS].into_boxed_slice(),
     });
+}
+
+#[inline]
+fn cache_index(w0: u64, w1: u64, len: usize) -> usize {
+    let h = (w0 ^ w1.rotate_left(29) ^ (len as u64).rotate_left(57))
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    (h >> (64 - CACHE_BITS)) as usize
+}
+
+/// Pack piece bytes `[start, start+len)` (2 <= len <= 16) into two
+/// little-endian zero-padded words. When 16 bytes of the underlying text are
+/// readable from `start`, this is a single unaligned 16-byte load plus
+/// branchless masking; only pieces within 16 bytes of the end of the text
+/// take the copy fallback.
+#[inline]
+fn key_words(bytes: &[u8], start: usize, len: usize) -> (u64, u64) {
+    debug_assert!((2..=16).contains(&len) && start + len <= bytes.len());
+    if start + 16 <= bytes.len() {
+        // SAFETY: 16 bytes from `start` are in bounds, checked above.
+        let (a, b) = unsafe {
+            let p = bytes.as_ptr().add(start);
+            (
+                u64::from_le((p as *const u64).read_unaligned()),
+                u64::from_le((p.add(8) as *const u64).read_unaligned()),
+            )
+        };
+        let l0 = len.min(8);
+        let m0 = u64::MAX >> ((64 - 8 * l0) & 63);
+        let bits1 = 8 * (len - l0);
+        let m1 = (u64::MAX >> ((64 - bits1) & 63)) * ((bits1 != 0) as u64);
+        (a & m0, b & m1)
+    } else {
+        let mut buf = [0u8; 16];
+        buf[..len].copy_from_slice(&bytes[start..start + len]);
+        (
+            u64::from_le_bytes(buf[..8].try_into().unwrap()),
+            u64::from_le_bytes(buf[8..].try_into().unwrap()),
+        )
+    }
 }
 
 #[derive(Debug)]
@@ -385,32 +408,51 @@ impl Tokenizer {
     pub fn encode_ordinary_into(&self, text: &str, out: &mut Vec<u32>) {
         PIECE_CACHE.with_borrow_mut(|cache| {
             if cache.owner != self.id {
-                cache.map.clear();
+                cache.entries.fill(EMPTY_ENTRY);
                 cache.owner = self.id;
             }
             let bytes = text.as_bytes();
             scan::for_each_piece(text, self.pattern, |start, end| {
-                let piece = &bytes[start..end];
-                if piece.len() == 1 {
-                    out.push(self.byte_token[piece[0] as usize]);
+                let len = end - start;
+                if len == 1 {
+                    out.push(self.byte_token[bytes[start] as usize]);
                     return;
                 }
-                if piece.len() <= MAX_CACHED_PIECE {
-                    let key = PieceKey::new(piece);
-                    if let Some(ids) = cache.map.get(&key) {
-                        out.extend_from_slice(ids);
+                if len <= MAX_CACHED_PIECE {
+                    let (w0, w1) = key_words(bytes, start, len);
+                    let idx = cache_index(w0, w1, len);
+                    // SAFETY: cache_index yields < CACHE_SLOTS == entries.len().
+                    let e = unsafe { cache.entries.get_unchecked(idx) };
+                    if e.w0 == w0 && e.w1 == w1 && (e.meta >> 8) as usize == len {
+                        let n = (e.meta & 0xff) as usize;
+                        out.reserve(6);
+                        // SAFETY: capacity ensured above; always copy the full
+                        // fixed-size id block, then expose only `n` of it.
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(
+                                e.ids.as_ptr(),
+                                out.as_mut_ptr().add(out.len()),
+                                6,
+                            );
+                            out.set_len(out.len() + n);
+                        }
                         return;
                     }
                     let from = out.len();
-                    self.encode_piece(piece, out);
-                    if cache.map.len() >= CACHE_CAP {
-                        cache.map.clear();
-                    }
-                    if out.len() - from <= 6 {
-                        cache.map.insert(key, TokenIds::from_slice(&out[from..]));
+                    self.encode_piece(&bytes[start..end], out);
+                    let n = out.len() - from;
+                    if n <= 6 {
+                        let mut ids = [0u32; 6];
+                        ids[..n].copy_from_slice(&out[from..]);
+                        cache.entries[idx] = CacheEntry {
+                            w0,
+                            w1,
+                            meta: ((len << 8) | n) as u32,
+                            ids,
+                        };
                     }
                 } else {
-                    self.encode_piece(piece, out);
+                    self.encode_piece(&bytes[start..end], out);
                 }
             });
         });
@@ -421,6 +463,9 @@ impl Tokenizer {
         if let Some(&id) = self.token_map.get(piece) {
             out.push(id);
             return;
+        }
+        if piece.len() > LONG_PIECE {
+            return self.encode_piece_long(piece, out);
         }
         let mut ids: SmallVec<[u32; 64]> = piece
             .iter()
@@ -453,6 +498,64 @@ impl Tokenizer {
             }
         }
         out.extend_from_slice(&ids);
+    }
+
+    /// Heap-based merge for long pieces (unbroken CJK / long punct runs).
+    ///
+    /// The scan-for-min loop is O(n) per merge, O(n^2) per piece; a binary
+    /// heap over candidate pairs makes it O(n log n). Entries are validated
+    /// lazily on pop: a pair (rank, left, right) applies iff `right` still
+    /// immediately follows `left` and the pair still merges to `rank` —
+    /// otherwise a fresher entry for the same position is (or was) in the
+    /// heap. Ordering by (rank, position) reproduces tiktoken's
+    /// leftmost-lowest-rank choice exactly.
+    fn encode_piece_long(&self, piece: &[u8], out: &mut Vec<u32>) {
+        use std::cmp::Reverse;
+        use std::collections::BinaryHeap;
+        let n = piece.len();
+        let mut ids: Vec<u32> = piece
+            .iter()
+            .map(|&b| self.byte_token[b as usize])
+            .collect();
+        // Doubly-linked list over positions; next[i] == n means end.
+        let mut next: Vec<u32> = (1..=n as u32).collect();
+        let mut prev: Vec<u32> = (0..n as u32).map(|i| i.wrapping_sub(1)).collect();
+        let mut heap: BinaryHeap<Reverse<(u32, u32, u32)>> =
+            BinaryHeap::with_capacity(n);
+        for i in 0..n - 1 {
+            let r = self.pair_rank(ids[i], ids[i + 1]);
+            if r != RANK_NONE {
+                heap.push(Reverse((r, i as u32, i as u32 + 1)));
+            }
+        }
+        while let Some(Reverse((r, l, rt))) = heap.pop() {
+            let (l, rt) = (l as usize, rt as usize);
+            if next[l] as usize != rt || self.pair_rank(ids[l], ids[rt]) != r {
+                continue; // stale
+            }
+            ids[l] = r;
+            let nn = next[rt] as usize;
+            next[l] = nn as u32;
+            if nn < n {
+                prev[nn] = l as u32;
+                let nr = self.pair_rank(r, ids[nn]);
+                if nr != RANK_NONE {
+                    heap.push(Reverse((nr, l as u32, nn as u32)));
+                }
+            }
+            let p = prev[l];
+            if p != u32::MAX {
+                let pr = self.pair_rank(ids[p as usize], r);
+                if pr != RANK_NONE {
+                    heap.push(Reverse((pr, p, l as u32)));
+                }
+            }
+        }
+        let mut i = 0usize;
+        while i < n {
+            out.push(ids[i]);
+            i = next[i] as usize;
+        }
     }
 
     #[inline]

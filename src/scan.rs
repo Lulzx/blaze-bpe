@@ -481,6 +481,250 @@ pub fn next_piece_o200k(s: &str, i: usize) -> usize {
     scan_whitespace(s, i, k0, l0)
 }
 
+/// Byte-class bitmasks for a 64-byte window, one bit per byte. Piece-boundary
+/// decisions become shift + count-trailing-zeros instead of per-byte branchy
+/// loads, and one classification is shared by every piece in the window.
+#[cfg(target_arch = "aarch64")]
+#[derive(Clone, Copy, Default)]
+struct ClassWin {
+    /// ASCII letter (case-folded a-z)
+    l: u64,
+    /// ASCII digit
+    d: u64,
+    /// literal \r or \n
+    nl: u64,
+    /// ASCII whitespace: \t \n \v \f \r space
+    ws: u64,
+    /// non-ASCII (byte >= 0x80)
+    na: u64,
+    /// literal space
+    sp: u64,
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+unsafe fn classify64(p: *const u8) -> ClassWin {
+    use std::arch::aarch64::*;
+    const BITS: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128];
+    /// 1-bit-per-byte movemask over four 16-byte compare results.
+    #[inline]
+    unsafe fn mm64(
+        m: [uint8x16_t; 4],
+        bits: uint8x16_t,
+    ) -> u64 {
+        let t0 = vpaddq_u8(vandq_u8(m[0], bits), vandq_u8(m[1], bits));
+        let t1 = vpaddq_u8(vandq_u8(m[2], bits), vandq_u8(m[3], bits));
+        let t2 = vpaddq_u8(t0, t1);
+        let t3 = vpaddq_u8(t2, t2);
+        vgetq_lane_u64(vreinterpretq_u64_u8(t3), 0)
+    }
+    let bits = vld1q_u8(BITS.as_ptr());
+    let v = [
+        vld1q_u8(p),
+        vld1q_u8(p.add(16)),
+        vld1q_u8(p.add(32)),
+        vld1q_u8(p.add(48)),
+    ];
+    let mut is_l = [vdupq_n_u8(0); 4];
+    let mut is_d = [vdupq_n_u8(0); 4];
+    let mut is_nl = [vdupq_n_u8(0); 4];
+    let mut is_ws = [vdupq_n_u8(0); 4];
+    let mut is_na = [vdupq_n_u8(0); 4];
+    let mut is_sp = [vdupq_n_u8(0); 4];
+    for k in 0..4 {
+        let folded = vorrq_u8(v[k], vdupq_n_u8(0x20));
+        is_l[k] = vcltq_u8(vsubq_u8(folded, vdupq_n_u8(b'a')), vdupq_n_u8(26));
+        is_d[k] = vcltq_u8(vsubq_u8(v[k], vdupq_n_u8(b'0')), vdupq_n_u8(10));
+        is_na[k] = vcgeq_u8(v[k], vdupq_n_u8(0x80));
+        is_nl[k] = vorrq_u8(
+            vceqq_u8(v[k], vdupq_n_u8(b'\n')),
+            vceqq_u8(v[k], vdupq_n_u8(b'\r')),
+        );
+        is_sp[k] = vceqq_u8(v[k], vdupq_n_u8(b' '));
+        is_ws[k] = vorrq_u8(
+            is_sp[k],
+            vcltq_u8(vsubq_u8(v[k], vdupq_n_u8(0x09)), vdupq_n_u8(5)),
+        );
+    }
+    ClassWin {
+        l: mm64(is_l, bits),
+        d: mm64(is_d, bits),
+        nl: mm64(is_nl, bits),
+        ws: mm64(is_ws, bits),
+        na: mm64(is_na, bits),
+        sp: mm64(is_sp, bits),
+    }
+}
+
+/// Mask-driven cl100k piece loop.
+///
+/// Runs of `letters (space letters)*` — the dominant shape in real text — are
+/// emitted by a "pure lane": within the maximal region of the window that
+/// contains only letters and word-leading spaces, every piece boundary is a
+/// set bit in one precomputed start mask, so each piece costs a
+/// count-trailing-zeros and a clear-lowest-bit, with zero dispatch branches.
+/// Everything else dispatches off the class bitmasks (mirroring the
+/// alternation order of the pattern); non-ASCII, contractions, and
+/// whitespace runs fall back to the scalar `next_piece_cl100k`, which is
+/// exact.
+#[cfg(target_arch = "aarch64")]
+fn for_each_piece_cl100k_masked(s: &str, mut f: impl FnMut(usize, usize)) {
+    let b = s.as_bytes();
+    let n = s.len();
+    let mut i = 0usize;
+    // Window covers [wbase, wbase + 64); refilled so every dispatch has at
+    // least 3 bytes of mask lookahead. `wbase > i` doubles as "invalid".
+    let mut wbase = usize::MAX >> 1;
+    let mut w = ClassWin::default();
+    'outer: while i < n {
+        if i + 64 > n {
+            let e = next_piece_cl100k(s, i);
+            f(i, e);
+            i = e;
+            continue;
+        }
+        if wbase > i || i - wbase > 60 {
+            // SAFETY: i + 64 <= n, checked above.
+            w = unsafe { classify64(b.as_ptr().add(i)) };
+            wbase = i;
+        }
+        let off = i - wbase; // <= 60
+        let l = w.l >> off;
+        let sp = w.sp >> off;
+        // Pure lane. A position is impure if it is neither letter nor space,
+        // or a space not followed by a letter inside the window (the shift
+        // pulls in a zero at the top, so the window's last byte is
+        // conservatively impure when it is a space).
+        let impure = !(l | sp) | (sp & !(l >> 1));
+        if impure & 1 == 0 {
+            let region = impure.trailing_zeros() as usize; // >= 1
+            let region_mask = 1u64.checked_shl(region as u32).map_or(u64::MAX, |v| v - 1);
+            // Piece starts: the cursor plus every space in the region.
+            let mut sm = (sp & region_mask) | 1;
+            // Emit pieces between consecutive starts; the final start's piece
+            // may extend past the region, so defer it to the dispatch path.
+            loop {
+                let rest = sm & (sm - 1);
+                if rest == 0 {
+                    let s0 = sm.trailing_zeros() as usize;
+                    if s0 == 0 {
+                        break; // cursor piece crosses the region: dispatch
+                    }
+                    i += s0;
+                    continue 'outer;
+                }
+                f(
+                    i + sm.trailing_zeros() as usize,
+                    i + rest.trailing_zeros() as usize,
+                );
+                sm = rest;
+            }
+        }
+        // Alt 2 fast path: \p{L}+ starting with an ASCII letter.
+        if l & 1 != 0 {
+            let run = (!l).trailing_zeros() as usize;
+            let mut e = i + run;
+            if off + run == 64 || (w.na >> (off + run)) & 1 != 0 {
+                e = scan_letters(s, e);
+            }
+            f(i, e);
+            i = e;
+            continue;
+        }
+        // Alt 1 (contractions) must precede the prefix-word path.
+        if b[i] == b'\'' {
+            let e = next_piece_cl100k(s, i);
+            f(i, e);
+            i = e;
+            continue;
+        }
+        // Alt 2 with prefix: [^\r\n\p{L}\p{N}]?+ then ASCII letters.
+        let pfx = !(w.l | w.d | w.nl | w.na); // prefix class (incl. space/tab)
+        if (pfx >> off) & 1 != 0 && (l >> 1) & 1 != 0 {
+            let run = (!(l >> 2)).trailing_zeros() as usize;
+            let end_off = off + 2 + run;
+            let mut e = i + 2 + run;
+            if end_off == 64 || (w.na >> end_off) & 1 != 0 {
+                e = scan_letters(s, e);
+            }
+            f(i, e);
+            i = e;
+            continue;
+        }
+        // Alt 3: \p{N}{1,3}, all-ASCII case.
+        let d = w.d >> off;
+        if d & 1 != 0 {
+            let dr = (!d).trailing_zeros() as usize;
+            if dr >= 3 {
+                f(i, i + 3);
+                i += 3;
+                continue;
+            }
+            // dr in {1,2}: genuine non-digit inside the window ends the run,
+            // unless it is non-ASCII (could be a Unicode digit) -> scalar.
+            if (w.na >> (off + dr)) & 1 == 0 {
+                f(i, i + dr);
+                i += dr;
+                continue;
+            }
+            let e = next_piece_cl100k(s, i);
+            f(i, e);
+            i = e;
+            continue;
+        }
+        // Alt 4: ` ?[^\s\p{L}\p{N}]++[\r\n]*`, all-ASCII case.
+        let pu = !(w.l | w.d | w.ws | w.na); // strict ASCII punct
+        let (pstart_off, pstart) = if (pu >> off) & 1 != 0 {
+            (off, i)
+        } else if b[i] == b' ' && (pu >> (off + 1)) & 1 != 0 {
+            (off + 1, i + 1)
+        } else {
+            // Alts 5-7 (whitespace), all-ASCII case: a \s run containing a
+            // newline ends after its last \r/\n; otherwise the final \s char
+            // glues onto the next piece (`\s+(?!\S)`), except a length-1 run.
+            let wsv = w.ws >> off;
+            if wsv & 1 != 0 {
+                let wr = (!wsv).trailing_zeros() as usize;
+                if off + wr < 64 && (w.na >> (off + wr)) & 1 == 0 {
+                    let nlrun = (w.nl >> off) & ((1u64 << wr) - 1);
+                    let e = if nlrun != 0 {
+                        i + 64 - nlrun.leading_zeros() as usize
+                    } else {
+                        i + (wr - 1).max(1)
+                    };
+                    f(i, e);
+                    i = e;
+                    continue;
+                }
+            }
+            // Non-ASCII or window-boundary cases: scalar.
+            let e = next_piece_cl100k(s, i);
+            f(i, e);
+            i = e;
+            continue;
+        };
+        let run = (!(pu >> pstart_off)).trailing_zeros() as usize;
+        let end_off = pstart_off + run;
+        if end_off == 64 || (w.na >> end_off) & 1 != 0 {
+            // Run reaches the window end or a non-ASCII char: rescan exact.
+            let e = next_piece_cl100k(s, i);
+            f(i, e);
+            i = e;
+            continue;
+        }
+        let tail = (!(w.nl >> end_off)).trailing_zeros() as usize;
+        if end_off + tail == 64 {
+            let e = next_piece_cl100k(s, i);
+            f(i, e);
+            i = e;
+            continue;
+        }
+        let e = pstart + run + tail;
+        f(i, e);
+        i = e;
+    }
+}
+
 /// Split `s` into pretokenization pieces, invoking `f(start, end)` per piece.
 #[inline]
 pub fn for_each_piece(s: &str, pattern: Pattern, mut f: impl FnMut(usize, usize)) {
@@ -488,6 +732,11 @@ pub fn for_each_piece(s: &str, pattern: Pattern, mut f: impl FnMut(usize, usize)
     let n = s.len();
     match pattern {
         Pattern::Cl100k => {
+            #[cfg(target_arch = "aarch64")]
+            {
+                for_each_piece_cl100k_masked(s, f);
+            }
+            #[cfg(not(target_arch = "aarch64"))]
             while i < n {
                 let e = next_piece_cl100k(s, i);
                 debug_assert!(e > i);
