@@ -117,6 +117,25 @@ all-core clocks; measure plugged in. Per-regime single-thread numbers
 ~580 MB/s, one unbroken novel CJK run ~100 MB/s (repeated CJK sentences hit
 the long-piece cache and run at ~370 MB/s).
 
+#### End-to-end (loading included)
+
+The ratios above time the *encode loop only* — both harnesses hoist vocab
+loading and warmup out of the timer, so it's a fair apples-to-apples encode
+comparison, not a cold single-shot. Construction is a one-time tax: blaze's
+vocab load + pair-table build is ~28 ms, tiktoken's `get_encoding` + lazy core
+init is ~78 ms. Counting load plus one cold encode pass (M4 Pro):
+
+| doc     | blaze e2e | tiktoken e2e | e2e ratio | hot-loop ratio |
+|---------|----------:|-------------:|----------:|---------------:|
+| 1.1 MB  |     29 ms |       131 ms |     4.5x  |          ~40x  |
+| 8.9 MB  |     31 ms |       521 ms |      17x  |         ~130x  |
+| 32.3 MB |     37 ms |      1687 ms |      45x  |         ~175x  |
+
+blaze is faster end-to-end at every size, but the multiple collapses on small
+inputs where its own ~28 ms load dominates a sub-millisecond encode — the
+warm-loop numbers are the ones that matter for a long-running process
+(serving tokenizer, training pipeline) that loads once and encodes forever.
+
 Reproduce with:
 
 ```sh
