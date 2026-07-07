@@ -38,7 +38,15 @@ tokenizers 0.22:
 | tiktoken-rs              |               14.4 |                118.3 |
 | HF tokenizers (Python)   |                4.7 |                 10.0 |
 
-Chunked-parallel single document: 1180 MB/s (1.1 MB), 1938 MB/s (8.9 MB).
+Chunked-parallel single document: 1180 MB/s (1.1 MB), ~2000 MB/s (32 MB).
+
+### vs Python tiktoken on one long document (32 MB, cl100k)
+
+Interleaved measurement (`python3 scripts/ratio.py`), identical token output:
+tiktoken ~20-21 MB/s single-thread; blaze chunked-parallel ~2000-2050 MB/s on
+AC power (**~98-100x**, best round 100.3x), ~1700-1900 MB/s on battery power
+(~85-90x — macOS reduces all-core sustained clocks when discharging).
+Measure plugged in.
 
 Reproduce with:
 
