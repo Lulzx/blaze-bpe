@@ -125,7 +125,13 @@ pub struct Tokenizer {
     pair_table: FxHashMap<u64, u32>,
     specials: FxHashMap<String, u32>,
     special_ac: Option<AhoCorasick>,
+    /// Reusable chunk-output buffers for `encode_parallel` (avoids a
+    /// large-alloc mmap/munmap cycle per chunk per call).
+    chunk_buffers: std::sync::Mutex<Vec<Vec<u32>>>,
 }
+
+/// Max buffers retained in the chunk pool (bounds steady-state memory).
+const CHUNK_POOL_CAP: usize = 256;
 
 impl Tokenizer {
     /// Build from the contents of a `.tiktoken` vocab file
@@ -212,6 +218,7 @@ impl Tokenizer {
             pair_table,
             specials,
             special_ac,
+            chunk_buffers: std::sync::Mutex::new(Vec::new()),
         })
     }
 
@@ -283,7 +290,19 @@ impl Tokenizer {
         cuts.push(text.len());
         let parts: Vec<Vec<u32>> = cuts
             .par_windows(2)
-            .map(|w| self.encode_sequential(&text[w[0]..w[1]]))
+            .map(|w| {
+                let chunk = &text[w[0]..w[1]];
+                let mut buf = self
+                    .chunk_buffers
+                    .lock()
+                    .unwrap()
+                    .pop()
+                    .unwrap_or_default();
+                buf.clear();
+                buf.reserve(chunk.len() / 3 + 16);
+                self.encode_ordinary_into(chunk, &mut buf);
+                buf
+            })
             .collect();
         // Parallel concat: copy each part into its precomputed offset of the
         // output buffer. Regions are disjoint by construction.
@@ -300,6 +319,13 @@ impl Tokenizer {
             std::ptr::copy_nonoverlapping(p.as_ptr(), (base as *mut u32).add(off), p.len());
         });
         unsafe { out.set_len(total) };
+        let mut pool = self.chunk_buffers.lock().unwrap();
+        for p in parts {
+            if pool.len() >= CHUNK_POOL_CAP {
+                break;
+            }
+            pool.push(p);
+        }
         out
     }
 
