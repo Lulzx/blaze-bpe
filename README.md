@@ -18,8 +18,11 @@ Apple Silicon (M-series), single thread, vs tiktoken-rs 0.6:
 
 o200k_base: 21.9x–28.0x. Batch encoding with rayon (545 × 2KB docs):
 **~3.0 GB/s**. Chunked-parallel encoding of a *single* long document
-(`encode` auto-splits at piece-safe boundaries above 256KB): **3.9 GB/s**
-on an 8.9 MB document, 6.7x over sequential, byte-identical output.
+(`encode` auto-splits at piece-safe boundaries above 256KB): **2.4 GB/s**
+on an 8.9 MB document (same-session best-of-5; the isolated peak is ~3.9 GB/s),
+4.3x over sequential, byte-identical output. On multi-GB corpora blaze is joined
+— and at 1 GB overtaken — by [gigatoken](https://github.com/marcelroed/gigatoken),
+a whole-file bulk tokenizer benchmarked alongside it below.
 
 ### Cross-implementation showdown
 
@@ -37,6 +40,7 @@ omnitoken 0.1.4 / tiktoken-go 0.1.8 on go1.26:
 | omnitoken (pure Go)      |               60.3 |                      |
 | bpe-openai (rust-gems)   |               53.5 |                127.6 |
 | rs-bpe (Python bindings) |               46.7 |                      |
+| gigatoken (whole-file)   |               44.6 |                      |
 | tiktoken (Python, native core) |         21.8 |     89.3 (threads)   |
 | tiktoken-rs              |               14.4 |                118.9 |
 | tiktoken-go              |                9.2 |                      |
@@ -45,6 +49,12 @@ omnitoken 0.1.4 / tiktoken-go 0.1.8 on go1.26:
 Chunked-parallel single document: 1330 MB/s (1.1 MB), 3877 MB/s (8.9 MB).
 Counting without materializing tokens (`count`, same 1.1 MB doc,
 chunked-parallel): 1230 MB/s.
+
+gigatoken's 44.6 MB/s here is not a single-thread number — it's its whole-file
+`bench` on this 1.1 MB doc, where its fixed per-call setup (~20 ms) dominates and
+its parallelism has nothing to bite on. That overhead only amortizes on
+gigabyte-scale input; the [size sweep](#throughput-across-document-sizes) shows
+it climbing from last place at 1 MB to first at 1 GB.
 
 Decode (ids -> text, same corpus): omnitoken 545 MB/s, blaze 480 MB/s,
 rs-bpe 306 MB/s, tiktoken-go 194 MB/s, tiktoken (Python) 188 MB/s.
@@ -107,15 +117,19 @@ uvx --with tokenizers --from gigatoken gigatoken bench 'Xenova/gpt-4' data/owt_1
 ### Encoding 1 GB of text (cl100k_base)
 
 One 1.0 GB document (shakespeare x900, 271,646,100 tokens), identical token
-output across all implementations, M4 Pro. Rivals via their Python bindings
-(FFI overhead is fully amortized at this size — every implementation's
-throughput is flat from 32 MB to 1 GB); quicktok is the C++ tokenizer from
-the HF forums, the fastest non-blaze implementation measured:
+output across all implementations, best of 5, one thermal session, M4 Pro.
+[gigatoken](https://github.com/marcelroed/gigatoken) and blaze (parallel) both
+auto-parallelize across all 12 cores; quicktok/rs-bpe/tiktoken are single-thread
+(Python bindings, FFI fully amortized at this size). At 1 GB gigatoken's
+whole-file design edges past blaze's chunked-parallel encode — the crossover the
+[size sweep](#throughput-across-document-sizes) and
+[OpenWebText](#vs-gigatoken-on-real-world-text-openwebtext) sections trace:
 
 | implementation           | tokens/s   | wall time for 1 GB | vs tiktoken |
 |--------------------------|-----------:|-------------------:|------------:|
-| **blaze-bpe (parallel)** |  **1.14B** |         **0.24 s** |    **200x** |
-| blaze-bpe (1 thread)     |       150M |              1.8 s |         26x |
+| **gigatoken**            |   **852M** |         **0.32 s** |    **149x** |
+| **blaze-bpe (parallel)** |   **745M** |         **0.36 s** |    **131x** |
+| blaze-bpe (1 thread)     |       149M |              1.8 s |         26x |
 | quicktok 0.4 (C++)       |      37.1M |              7.3 s |        6.5x |
 | rs-bpe 0.1               |      12.3M |             22.1 s |        2.1x |
 | tiktoken 0.12            |       5.7M |             47.4 s |          1x |
@@ -123,24 +137,30 @@ the HF forums, the fastest non-blaze implementation measured:
 ![Encoding 1 GB of text, cl100k_base](assets/blaze_1gb_graph.png)
 
 (HF tokenizers omitted at this size: its per-token `Encoding` metadata needs
-~16-22 GB of RAM. At 32 MB it measures 1.0M tokens/s.)
+~16-22 GB of RAM. At 32 MB it measures 1.0M tokens/s. These all-core figures are
+a same-session best-of-5 under concurrent load; the isolated plugged-in peak is
+higher — see the [32 MB interleaved measurement](#vs-python-tiktoken-on-one-long-document-32-mb-cl100k).)
 
 Same 1 GB document with **o200k_base** (the encoding used by GPT-4o/4.1/5,
 o1, o3 and o4-mini; 267,845,400 tokens, again byte-identical everywhere):
-blaze parallel 590M tokens/s (0.45 s, **75x tiktoken**), blaze single-thread
-87M tokens/s (11x), quicktok 31.4M (4.0x), rs-bpe 10.5M (1.3x), tiktoken
-7.8M (34.2 s). The bigger vocab costs every implementation throughput in
-MB/s, but tiktoken's regex-bound scanner is unaffected, so ratios compress
-relative to cl100k.
+gigatoken 870M tokens/s (0.31 s, **112x tiktoken**), blaze parallel 506M
+(0.53 s, 65x), blaze single-thread 85M (11x), quicktok 31.4M (4.0x), rs-bpe
+10.5M (1.3x), tiktoken 7.8M (34.3 s). gigatoken's throughput is vocab-agnostic,
+so on the bigger o200k vocab — which costs blaze and the others MB/s — its lead
+over blaze widens to 1.7x.
 
 ![Encoding 1 GB of text, o200k_base](assets/blaze_1gb_o200k_graph.png)
 
 ### Throughput across document sizes
 
 Single-document tokens/s at 1.1 MB / 8.9 MB / 32.3 MB (cl100k_base, log
-scale; every implementation is flat across sizes, i.e. these are
-steady-state numbers, and blaze's chunked-parallel line pulls further ahead
-as the document grows):
+scale; the single-thread rivals are flat across sizes, i.e. steady-state, while
+blaze's chunked-parallel line pulls ahead as the document grows). gigatoken (the
+red line) is the mirror image: its per-call overhead sinks it to the bottom at
+1.1 MB (12M tok/s, below rs-bpe), but it climbs steeply and crosses above blaze's
+single-thread line by 32 MB — then overtakes blaze's *parallel* line at 1 GB (the
+[bar chart above](#encoding-1-gb-of-text-cl100k_base)). blaze owns everything up
+to ~32 MB; gigatoken owns the gigabyte:
 
 ![Encoding speed on large documents](assets/blaze_large_graph.png)
 
@@ -155,7 +175,9 @@ Python call overhead, which is why small-text benchmarks flatter no one:
 Interleaved measurement (`python3 scripts/ratio.py`), identical token output,
 M4 Pro (8P+4E): tiktoken ~21 MB/s single-thread; blaze chunked-parallel
 **~4.2 GB/s (~198x)**, warm sequential ~575 MB/s. Battery power throttles
-all-core clocks; measure plugged in. Per-regime single-thread numbers
+all-core clocks; measure plugged in. This is the *isolated* peak (nothing else
+running); the same-session best-of-5 all-core figures in the charts and 1 GB
+tables above run ~30% lower under concurrent load. Per-regime single-thread numbers
 (`cargo run --release --example regimes`): cold/novel ~290 MB/s, warm/repeat
 ~580 MB/s, one unbroken novel CJK run ~100 MB/s (repeated CJK sentences hit
 the long-piece cache and run at ~370 MB/s).
