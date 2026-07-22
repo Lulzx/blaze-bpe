@@ -61,6 +61,49 @@ Rival marketing claims, re-measured here on identical input:
   slower than tiktoken's real Rust core. blaze-bpe is ~10x omnitoken
   single-threaded on the identical input.
 
+### vs gigatoken on real-world text (OpenWebText)
+
+[gigatoken](https://github.com/marcelroed/gigatoken) is a whole-file tokenizer
+built for raw throughput on huge corpora: it swallows an entire file, finds
+document and piece boundaries itself, and saturates every core. Its published
+benchmark runs on `owt_train.txt` (OpenWebText, 11.9 GB). Measured here on the
+same corpus and machine (M4 Pro, 8P+4E, 24 GB), both cl100k_base — gigatoken via
+a HuggingFace cl100k tokenizer (`Xenova/gpt-4`), blaze via `encode` (whole-file
+chunked-parallel):
+
+| corpus (cl100k)    |  size | blaze parallel | blaze 1-thread | gigatoken |
+|--------------------|------:|---------------:|---------------:|----------:|
+| shakespeare        | 1.1 MB|     0.87 GB/s  |     0.57 GB/s  | 0.05 GB/s |
+| big.txt (English)  |  32 MB|     3.53 GB/s  |     0.55 GB/s  | 0.83 GB/s |
+| OpenWebText sample |   1 GB|     2.05 GB/s  |     0.26 GB/s  | 3.75 GB/s |
+
+The two tools cross over with input size. blaze wins by ~13x at 1 MB and ~4x at
+32 MB: its per-thread piece cache and near-zero fixed overhead make it fast the
+instant it's called, so short-to-medium inputs — the common serving/RAG case —
+are where it dominates. gigatoken pays a large fixed setup cost per call (a
+~20 ms floor, visible as the 48 MB/s on 1 MB) that only amortizes on
+gigabyte-scale files, and there it pulls ahead: 3.75 GB/s on 1 GB of OpenWebText
+vs blaze's 2.05.
+
+Two honest caveats. blaze's throughput is content-sensitive — big.txt (English
+prose, cache-friendly) runs at 3.53 GB/s but diverse real web text at 1 GB drops
+to 2.05, whereas gigatoken is nearly content-agnostic. And gigatoken through the
+HF cl100k tokenizer emits 214.6M tokens on the 1 GB sample vs blaze's 215.7M:
+blaze is byte-identical to tiktoken, while HF's cl100k pre-tokenizer differs by
+~0.5%. gigatoken also OOM-crashed above ~1 GB on this 24 GB machine (its
+published multi-GB/s runs used far larger boxes), so the comparison is capped at
+1 GB here.
+
+Reproduce (streams a 1 GB slice of OpenWebText; the 4.6 GB gzip is never stored):
+
+```sh
+url=$(curl -sI https://huggingface.co/datasets/stanford-cs336/owt-sample/resolve/main/owt_train.txt.gz \
+      | grep -i '^location:' | tr -d '\r' | awk '{print $2}')
+curl -sL "$url" | gunzip | head -c 1000000000 > data/owt_1g.txt
+cargo run --release --example owt -- data/owt_1g.txt cl100k
+uvx --with tokenizers --from gigatoken gigatoken bench 'Xenova/gpt-4' data/owt_1g.txt
+```
+
 ### Encoding 1 GB of text (cl100k_base)
 
 One 1.0 GB document (shakespeare x900, 271,646,100 tokens), identical token
