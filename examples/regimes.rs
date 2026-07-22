@@ -29,6 +29,9 @@ fn main() {
             .unwrap()
     });
     println!("cold  (novel text):  {:>7.1} MB/s", mb / b);
+    if std::env::var_os("BLAZE_NO_VOCAB_SEED").is_some() {
+        println!("  ^ vocab-seed DISABLED (BLAZE_NO_VOCAB_SEED set): empty-cache cold");
+    }
 
     // Warm: same thread, cache populated by prior iterations.
     let (b, _) = best(12, || tok.encode_sequential(&text).len());

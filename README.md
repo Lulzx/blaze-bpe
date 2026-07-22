@@ -180,7 +180,15 @@ running); the same-session best-of-5 all-core figures in the charts and 1 GB
 tables above run ~30% lower under concurrent load. Per-regime single-thread numbers
 (`cargo run --release --example regimes`): cold/novel ~290 MB/s, warm/repeat
 ~580 MB/s, one unbroken novel CJK run ~100 MB/s (repeated CJK sentences hit
-the long-piece cache and run at ~370 MB/s).
+the long-piece cache and run at ~370 MB/s). The cold/novel figure includes the
+vocab-seeded piece cache (every single-token piece is pre-inserted at load, so a
+first-touch miss skips the BPE merge); with seeding disabled
+(`BLAZE_NO_VOCAB_SEED=1 cargo run --release --example regimes`) a genuinely
+empty-cache cold pass runs ~1.5x slower (~190 → ~125 MB/s idle, gap widening
+under throttle since the merge work dominates at low clocks). Warm/steady-state
+throughput is identical either way — seeding only affects the first touch of each
+distinct piece, which is why it matters for a single cold shot but not for a
+long-running encode loop.
 
 #### End-to-end (loading included)
 

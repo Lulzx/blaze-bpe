@@ -62,6 +62,18 @@ fn main() {
         blaze.encode_sequential(&text).len()
     });
     println!("{:<24}{:>10.1} MB/s", "blaze-bpe (cold cache)", mbps(total, t));
+    // Empty-cache blaze: same eviction, but the tokenizer is built with the
+    // vocab seed disabled, so a first-touch piece pays the full BPE merge
+    // rather than a seeded single-token hit — a genuinely empty cold pass.
+    unsafe { std::env::set_var("BLAZE_NO_VOCAB_SEED", "1") };
+    let unseeded = blaze_bpe::Tokenizer::cl100k_base("data/cl100k_base.tiktoken").unwrap();
+    unsafe { std::env::remove_var("BLAZE_NO_VOCAB_SEED") };
+    assert_eq!(unseeded.encode_sequential(&text).len(), want, "unseeded count mismatch");
+    let (t, _) = time_best(iters, || {
+        poison.encode_sequential("evict");
+        unseeded.encode_sequential(&text).len()
+    });
+    println!("{:<24}{:>10.1} MB/s", "blaze-bpe (empty cache)", mbps(total, t));
 
     println!("\n--- multicore, one long document (chunked-parallel) ---");
     let (t, _) = time_best(iters, || blaze.encode(&text).len());

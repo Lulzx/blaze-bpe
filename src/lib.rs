@@ -261,7 +261,12 @@ impl Tokenizer {
         }
 
         let mut vocab_cache = vec![EMPTY_ENTRY; CACHE_SLOTS].into_boxed_slice();
-        for (bytes, &id) in &token_map {
+        // Benchmark hook: `BLAZE_NO_VOCAB_SEED=1` leaves the shared vocab cache
+        // empty so first-touch pieces pay the full BPE merge, measuring a
+        // genuinely empty-cache cold pass. Off by default (seeding is the
+        // shipped behavior).
+        let seed_vocab_cache = std::env::var_os("BLAZE_NO_VOCAB_SEED").is_none();
+        for (bytes, &id) in token_map.iter().filter(|_| seed_vocab_cache) {
             let len = bytes.len();
             if !(2..=MAX_CACHED_PIECE).contains(&len) {
                 continue;
