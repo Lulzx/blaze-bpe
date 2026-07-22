@@ -117,19 +117,22 @@ uvx --with tokenizers --from gigatoken gigatoken bench 'Xenova/gpt-4' data/owt_1
 ### Encoding 1 GB of text (cl100k_base)
 
 One 1.0 GB document (shakespeare x900, 271,646,100 tokens), identical token
-output across all implementations, best of 5, one thermal session, M4 Pro.
+output across all implementations. **First-run measurement**: every timed pass
+is a fresh process, so cache population is included in the timing (no warmup) —
+the honest number for a one-shot bulk job, and apples-to-apples with gigatoken's
+fresh-process `bench`. Best of 5, one thermal session, M4 Pro.
 [gigatoken](https://github.com/marcelroed/gigatoken) and blaze (parallel) both
 auto-parallelize across all 12 cores; quicktok/rs-bpe/tiktoken are single-thread
 (Python bindings, FFI fully amortized at this size). At 1 GB gigatoken's
-whole-file design edges past blaze's chunked-parallel encode — the same crossover
-the [OpenWebText](#vs-gigatoken-on-real-world-text-openwebtext) section traces on
-real web text:
+whole-file design pulls ahead of blaze's chunked-parallel encode — the same
+crossover the [OpenWebText](#vs-gigatoken-on-real-world-text-openwebtext) section
+traces on real web text:
 
 | implementation           | tokens/s   | wall time for 1 GB | vs tiktoken |
 |--------------------------|-----------:|-------------------:|------------:|
-| **gigatoken**            |  **1117M** |         **0.24 s** |    **196x** |
-| **blaze-bpe (parallel)** |  **1044M** |         **0.26 s** |    **183x** |
-| blaze-bpe (1 thread)     |       138M |              2.0 s |         24x |
+| **gigatoken**            |  **1278M** |         **0.21 s** |    **224x** |
+| **blaze-bpe (parallel)** |   **863M** |         **0.32 s** |    **151x** |
+| blaze-bpe (1 thread)     |       130M |              2.1 s |         23x |
 | quicktok 0.4 (C++)       |      37.1M |              7.3 s |        6.5x |
 | rs-bpe 0.1               |      12.3M |             22.1 s |        2.2x |
 | tiktoken 0.12            |       5.7M |             47.7 s |          1x |
@@ -137,17 +140,18 @@ real web text:
 ![Encoding 1 GB of text, cl100k_base](assets/blaze_1gb_graph.png)
 
 (HF tokenizers omitted at this size: its per-token `Encoding` metadata needs
-~16-22 GB of RAM. At 32 MB it measures 1.0M tokens/s. These all-core figures are
-a same-session best-of-5 under concurrent load; the isolated plugged-in peak is
-higher — see the [32 MB interleaved measurement](#vs-python-tiktoken-on-one-long-document-32-mb-cl100k).)
+~16-22 GB of RAM. At 32 MB it measures 1.0M tokens/s. These are all-core
+first-run figures — each timed pass a fresh process with a cold tokenizer cache;
+a warm pre-populated loop measures somewhat higher but is not what a one-shot
+bulk tokenization does.)
 
 Same 1 GB document with **o200k_base** (the encoding used by GPT-4o/4.1/5,
-o1, o3 and o4-mini; 267,845,400 tokens, again byte-identical everywhere):
-gigatoken 1001M tokens/s (0.27 s, **128x tiktoken**), blaze parallel 634M
-(0.42 s, 81x), blaze single-thread 84M (11x), quicktok 31.4M (4.0x), rs-bpe
-10.5M (1.3x), tiktoken 7.8M (34.3 s). gigatoken's throughput is vocab-agnostic,
-so on the bigger o200k vocab — which costs blaze and the others MB/s — its lead
-over blaze widens to 1.6x.
+o1, o3 and o4-mini; 267,845,400 tokens, again byte-identical everywhere),
+same first-run methodology: gigatoken 1085M tokens/s (0.25 s, **139x tiktoken**),
+blaze parallel 573M (0.47 s, 73x), blaze single-thread 81M (10x), quicktok 31.4M
+(4.0x), rs-bpe 10.5M (1.3x), tiktoken 7.8M (34.3 s). gigatoken's throughput is
+vocab-agnostic, so on the bigger o200k vocab — which costs blaze and the others
+MB/s — its lead over blaze widens to 1.9x.
 
 ![Encoding 1 GB of text, o200k_base](assets/blaze_1gb_o200k_graph.png)
 
@@ -156,9 +160,10 @@ over blaze widens to 1.6x.
 Interleaved measurement (`python3 scripts/ratio.py`), identical token output,
 M4 Pro (8P+4E): tiktoken ~21 MB/s single-thread; blaze chunked-parallel
 **~4.2 GB/s (~198x)**, warm sequential ~575 MB/s. Battery power throttles
-all-core clocks; measure plugged in. This is the *isolated* peak (nothing else
-running); the same-session best-of-5 all-core figures in the charts and 1 GB
-tables above run ~30% lower under concurrent load. Per-regime single-thread numbers
+all-core clocks; measure plugged in. This is the warm, pre-populated *isolated*
+peak (nothing else running); the first-run all-core figures in the 1 GB charts
+and tables above run lower, since they include cache population and no warmup.
+Per-regime single-thread numbers
 (`cargo run --release --example regimes`): cold/novel ~290 MB/s, warm/repeat
 ~580 MB/s, one unbroken novel CJK run ~100 MB/s (repeated CJK sentences hit
 the long-piece cache and run at ~370 MB/s). The cold/novel figure includes the
@@ -195,8 +200,13 @@ Reproduce with:
 ```sh
 cargo test --release                     # byte-identical correctness vs tiktoken-rs
 cargo run --release --example compare    # throughput comparison table
+cargo run --release --example firstrun -- FILE  # first-run (cold-cache) throughput on a file
 cargo bench                              # criterion benchmarks
 ```
+
+The 1 GB first-run bars are reproduced with `scripts/bench_gigatoken.sh` (fresh
+gigatoken invocations) alongside `cargo run --release --example firstrun` for
+blaze; `python3 scripts/make_charts.py` renders the charts from those numbers.
 
 ## How it works
 

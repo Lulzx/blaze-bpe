@@ -31,14 +31,17 @@ plt.rcParams.update({
     "axes.edgecolor": "#cccccc",
 })
 
-# ---- FRESH same-session numbers (tokens/s), measured back-to-back on AC ----
-# gigatoken (best-of-5) and blaze measured in one thermal state, so the two
-# parallel series are directly comparable. Single-thread rivals kept at their
-# documented values (single-thread is reproducible; blaze 1-thread matches).
-# Only the 1 GB regime is charted; sub-1 GB sizes are omitted (per-call and
-# fixed-overhead effects make them a different, less representative regime).
-GT_1GB_CL = 1116.8e6  # 1 GB shakespeare x900, cl100k, best-of-5
-GT_1GB_O2 = 1000.5e6  # 1 GB shakespeare x900, o200k, best-of-5
+# ---- FRESH same-session FIRST-RUN numbers (tokens/s), measured on AC --------
+# First-run methodology: every measurement is a fresh process, so cache
+# population is included in the timed pass (no warmup). This is the honest
+# number for a one-shot bulk tokenization and is apples-to-apples with
+# gigatoken's fresh-process `bench`. Best of 5 fresh runs (file warm in the OS
+# page cache, tokenizer cache cold each time), gigatoken and blaze interleaved
+# in one thermal session. Single-thread rivals kept at their documented values
+# (single-thread is reproducible; on this repetitive 1 GB corpus first-run and
+# warm converge within the first chunk). Only the 1 GB regime is charted.
+GT_1GB_CL = 1277.8e6  # 1 GB shakespeare x900, cl100k, first-run best-of-5
+GT_1GB_O2 = 1084.6e6  # 1 GB shakespeare x900, o200k, first-run best-of-5
 # ---------------------------------------------------------------------------
 
 TOK_CL = 271_646_100
@@ -132,8 +135,8 @@ def line_chart(path, title, footer, xticklabels, xlabel, series, ymin, ymax):
 def main():
     # ---- Chart 1: 1 GB cl100k bar ----
     rows = [
-        ("blaze-bpe (parallel)", 1043.6e6, C["blaze_par"]),
-        ("blaze-bpe (1 thread)", 138.4e6, C["blaze_1t"]),
+        ("blaze-bpe (parallel)", 862.6e6, C["blaze_par"]),
+        ("blaze-bpe (1 thread)", 129.5e6, C["blaze_1t"]),
         ("quicktok", 37.1e6, C["quicktok"]),
         ("rs_bpe", 12.3e6, C["rs_bpe"]),
         ("tiktoken", 5.7e6, C["tiktoken"]),
@@ -142,15 +145,15 @@ def main():
         rows.append(("gigatoken", GT_1GB_CL, C["gigatoken"]))
     bar_chart("assets/blaze_1gb_graph.png",
               "Encoding 1 GB of Text (271.6M tokens, cl100k_base) — higher is better",
-              "single 1.0 GB document, best of 5 (gigatoken/blaze), same session · Apple M4 Pro, 12 cores · "
-              "blaze (parallel) & gigatoken auto-parallelize; quicktok/rs_bpe/tiktoken single-thread · "
-              "HF omitted (per-token Encoding needs ~16-22 GB)",
+              "single 1.0 GB document, first run (cache populated during the timed pass), best of 5, same session · "
+              "Apple M4 Pro, 12 cores · blaze (parallel) & gigatoken auto-parallelize; quicktok/rs_bpe/tiktoken "
+              "single-thread · HF omitted (per-token Encoding needs ~16-22 GB)",
               TOK_CL, rows)
 
     # ---- Chart 2: 1 GB o200k bar ----
     rows = [
-        ("blaze-bpe (parallel)", 634.1e6, C["blaze_par"]),
-        ("blaze-bpe (1 thread)", 84.4e6, C["blaze_1t"]),
+        ("blaze-bpe (parallel)", 573.3e6, C["blaze_par"]),
+        ("blaze-bpe (1 thread)", 81.0e6, C["blaze_1t"]),
         ("quicktok", 31.4e6, C["quicktok"]),
         ("rs_bpe", 10.5e6, C["rs_bpe"]),
         ("tiktoken", 7.8e6, C["tiktoken"]),
@@ -159,9 +162,9 @@ def main():
         rows.append(("gigatoken", GT_1GB_O2, C["gigatoken"]))
     bar_chart("assets/blaze_1gb_o200k_graph.png",
               "Encoding 1 GB of Text, o200k_base (GPT-4o/5, o1, o3) (267.8M tokens) — higher is better",
-              "single 1.0 GB document, best of 5 (gigatoken/blaze), same session · Apple M4 Pro, 12 cores · "
-              "blaze (parallel) & gigatoken auto-parallelize; quicktok/rs_bpe/tiktoken single-thread · "
-              "HF omitted (per-token Encoding needs ~16-22 GB)",
+              "single 1.0 GB document, first run (cache populated during the timed pass), best of 5, same session · "
+              "Apple M4 Pro, 12 cores · blaze (parallel) & gigatoken auto-parallelize; quicktok/rs_bpe/tiktoken "
+              "single-thread · HF omitted (per-token Encoding needs ~16-22 GB)",
               TOK_O2, rows)
 
     # Sub-1 GB charts (large-documents and small-inputs lines) intentionally
