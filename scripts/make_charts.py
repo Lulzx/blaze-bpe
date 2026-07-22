@@ -35,11 +35,10 @@ plt.rcParams.update({
 # gigatoken (best-of-5) and blaze measured in one thermal state, so the two
 # parallel series are directly comparable. Single-thread rivals kept at their
 # documented values (single-thread is reproducible; blaze 1-thread matches).
-GT_1GB_CL = 852.0e6   # 1 GB shakespeare x900, cl100k
-GT_1GB_O2 = 870.3e6   # 1 GB shakespeare x900, o200k
-GT_LARGE  = [12.1e6, 84.9e6, 196.1e6]   # [1.1 MB, 8.9 MB, 32.3 MB], cl100k
-GT_SMALL  = None      # omitted: gigatoken's per-call overhead makes 45 B-44 KB
-                      # single calls 100-1000x slower (a bulk tool, wrong regime)
+# Only the 1 GB regime is charted; sub-1 GB sizes are omitted (per-call and
+# fixed-overhead effects make them a different, less representative regime).
+GT_1GB_CL = 1116.8e6  # 1 GB shakespeare x900, cl100k, best-of-5
+GT_1GB_O2 = 1000.5e6  # 1 GB shakespeare x900, o200k, best-of-5
 # ---------------------------------------------------------------------------
 
 TOK_CL = 271_646_100
@@ -133,8 +132,8 @@ def line_chart(path, title, footer, xticklabels, xlabel, series, ymin, ymax):
 def main():
     # ---- Chart 1: 1 GB cl100k bar ----
     rows = [
-        ("blaze-bpe (parallel)", 745.0e6, C["blaze_par"]),
-        ("blaze-bpe (1 thread)", 148.8e6, C["blaze_1t"]),
+        ("blaze-bpe (parallel)", 1043.6e6, C["blaze_par"]),
+        ("blaze-bpe (1 thread)", 138.4e6, C["blaze_1t"]),
         ("quicktok", 37.1e6, C["quicktok"]),
         ("rs_bpe", 12.3e6, C["rs_bpe"]),
         ("tiktoken", 5.7e6, C["tiktoken"]),
@@ -150,8 +149,8 @@ def main():
 
     # ---- Chart 2: 1 GB o200k bar ----
     rows = [
-        ("blaze-bpe (parallel)", 506.1e6, C["blaze_par"]),
-        ("blaze-bpe (1 thread)", 84.8e6, C["blaze_1t"]),
+        ("blaze-bpe (parallel)", 634.1e6, C["blaze_par"]),
+        ("blaze-bpe (1 thread)", 84.4e6, C["blaze_1t"]),
         ("quicktok", 31.4e6, C["quicktok"]),
         ("rs_bpe", 10.5e6, C["rs_bpe"]),
         ("tiktoken", 7.8e6, C["tiktoken"]),
@@ -165,43 +164,9 @@ def main():
               "HF omitted (per-token Encoding needs ~16-22 GB)",
               TOK_O2, rows)
 
-    # ---- Chart 3: large documents line ----
-    series = [
-        ("blaze-bpe (parallel)", [191e6, 653e6, 811e6], C["blaze_par"], "o", False, "fill"),
-        ("blaze-bpe (1 thread)", [148e6, 150e6, 151e6], C["blaze_par"], "o", True, "open"),
-    ]
-    if GT_LARGE:
-        series.append(("gigatoken", GT_LARGE, C["gigatoken"], "P", False, "fill"))
-    series += [
-        ("quicktok", [34e6, 30e6, 30e6], C["quicktok"], "v", False, "fill"),
-        ("rs_bpe", [12e6, 11e6, 11e6], C["rs_bpe"], "^", False, "fill"),
-        ("tiktoken", [6.1e6, 6.0e6, 5.9e6], C["tiktoken"], "s", False, "fill"),
-        ("tokenizers", [1.3e6, 1.1e6, 1.0e6], C["tokenizers"], "D", False, "fill"),
-    ]
-    line_chart("assets/blaze_large_graph.png",
-               "Encoding Speed on Large Documents — tokens/second (higher is better, log scale)",
-               "cl100k_base, identical output, best of 5, same session · Apple M4 Pro · single-thread except blaze "
-               "(parallel) & gigatoken (auto-parallel) · tiktoken 0.12 / tokenizers 0.22 / rs-bpe 0.1 / quicktok 0.4 "
-               "via Python; blaze & gigatoken native",
-               ["1.1 MB\n(302K tokens)", "8.9 MB\n(2.4M tokens)", "32.3 MB\n(8.8M tokens)"],
-               "Single-document input size", series, 7e5, 2.2e9)
-
-    # ---- Chart 4: small inputs line (single-thread warm) ----
-    series = [
-        ("blaze-bpe", [145.8e6, 285.9e6, 258.3e6], C["blaze_par"], "o", False, "fill"),
-        ("rs_bpe", [15.5e6, 16.2e6, 13.6e6], C["rs_bpe"], "^", False, "fill"),
-        ("tiktoken", [5.8e6, 6.6e6, 6.5e6], C["tiktoken"], "s", False, "fill"),
-        ("tokenizers", [1.4e6, 2.0e6, 1.9e6], C["tokenizers"], "D", False, "fill"),
-    ]
-    if GT_SMALL:
-        series.insert(1, ("gigatoken", GT_SMALL, C["gigatoken"], "P", False, "fill"))
-    line_chart("assets/blaze_speed_graph.png",
-               "Encoding Speed on Small Inputs — tokens/second (higher is better, log scale)",
-               "cl100k_base, single thread, warm cache, best of 30 · Apple M4 Pro · tiktoken 0.12 / tokenizers 0.22 / "
-               "rs-bpe 0.1 (Python bindings) / blaze-bpe (native Rust) · gigatoken omitted: per-call overhead makes "
-               "single 45 B-44 KB calls 100-1000x slower (a bulk whole-file tool)",
-               ["small\n(45 bytes)", "medium\n(900 bytes)", "large\n(43.9 KB)"],
-               "Input size", series, 8e5, 1e9)
+    # Sub-1 GB charts (large-documents and small-inputs lines) intentionally
+    # dropped: the 1 GB regime is the representative bulk-throughput comparison,
+    # and smaller sizes are dominated by fixed/per-call overheads.
 
 
 if __name__ == "__main__":
