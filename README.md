@@ -279,9 +279,9 @@ documents instead. Both produce byte-identical output to sequential encoding.
    above ~384KB into ~192KB chunks, encodes them in parallel, and
    parallel-copies the parts into the output at precomputed offsets. Cuts are
    only made at positions where a pre-tokenization piece provably ends
-   regardless of scan alignment (after `\n` followed by non-whitespace, or
-   between an ASCII letter and a following space/digit/punct other than `'`),
-   so the result is byte-identical to sequential encoding;
+   regardless of scan alignment (after `\n` followed by neither whitespace nor
+   `/`, or between an ASCII letter and a following space/digit/punct other
+   than `'`), so the result is byte-identical to sequential encoding;
    `encode_sequential` bypasses this. Inputs with no safe cut (e.g. unbroken
    CJK) fall back to sequential automatically.
 

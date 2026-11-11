@@ -211,11 +211,13 @@ fn finish_whitespace(i: usize, e: usize, n: usize, last_nl_end: usize, last_star
     e
 }
 
-/// Punct alternative ` ?[^\s\p{L}\p{N}]+[\r\n]*` (o200k adds `/` to the tail
-/// class, which is unreachable there — `/` is always consumed by the `+` run).
+/// Punct alternative ` ?[^\s\p{L}\p{N}]+[\r\n]*`, or with `SLASH` the o200k
+/// form ` ?[^\s\p{L}\p{N}]+[\r\n/]*`. A `/` right after the `+` run is
+/// consumed by the run itself, but one after a `\r`/`\n` is only reachable
+/// through the tail class (`"//\n//"` is a single o200k piece).
 /// Returns None if the alternative does not match at `i`.
 #[inline]
-fn scan_punct(s: &str, i: usize, c0: char, k0: u8, l0: usize) -> Option<usize> {
+fn scan_punct<const SLASH: bool>(s: &str, i: usize, c0: char, k0: u8, l0: usize) -> Option<usize> {
     let n = s.len();
     let (pstart, pk, pl) = if c0 == ' ' {
         if i + 1 >= n {
@@ -244,7 +246,7 @@ fn scan_punct(s: &str, i: usize, c0: char, k0: u8, l0: usize) -> Option<usize> {
         }
         e += l;
     }
-    while e < n && (b[e] == b'\n' || b[e] == b'\r') {
+    while e < n && (b[e] == b'\n' || b[e] == b'\r' || (SLASH && b[e] == b'/')) {
         e += 1;
     }
     Some(e)
@@ -311,7 +313,7 @@ pub fn next_piece_cl100k(s: &str, i: usize) -> usize {
     }
 
     // Alt 4: ` ?[^\s\p{L}\p{N}]++[\r\n]*`
-    if let Some(e) = scan_punct(s, i, c0, k0, l0) {
+    if let Some(e) = scan_punct::<false>(s, i, c0, k0, l0) {
         return e;
     }
 
@@ -472,7 +474,7 @@ pub fn next_piece_o200k(s: &str, i: usize) -> usize {
     }
 
     // Alt 4: ` ?[^\s\p{L}\p{N}]+[\r\n/]*`
-    if let Some(e) = scan_punct(s, i, c0, k0, l0) {
+    if let Some(e) = scan_punct::<true>(s, i, c0, k0, l0) {
         return e;
     }
 
