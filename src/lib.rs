@@ -690,11 +690,11 @@ fn pair_key(l: u32, r: u32) -> u64 {
 ///
 /// Two conditions qualify (for both cl100k and o200k patterns):
 ///
-/// 1. After `\n`, when the next char is not whitespace. Word pieces can never
-///    contain `\n` (their optional prefix class excludes it); any piece
-///    covering the `\n` is a punct piece's `[\r\n]*` tail or a whitespace
-///    piece ending at the run's last newline, and both end here because the
-///    next char is neither newline nor whitespace.
+/// 1. After `\n`, when the next char is neither whitespace nor `/`. Word
+///    pieces can never contain `\n` (their optional prefix class excludes it);
+///    any piece covering the `\n` is a punct piece's `[\r\n]*` tail (o200k:
+///    `[\r\n/]*`, hence no `/`) or a whitespace piece ending at the run's last
+///    newline, and both end here because the next char is not in the tail.
 ///
 /// 2. Between an ASCII letter and a following space/digit/punct. Letters only
 ///    occur in word pieces (`\p{L}+` / `A*B+` bodies, contraction suffixes),
@@ -714,7 +714,7 @@ fn find_safe_cut(text: &str, from: usize) -> Option<usize> {
                 // `i` is a char boundary: the previous byte is ASCII.
                 text[i..].chars().next().unwrap().is_whitespace()
             };
-            if !ws {
+            if !ws && cur != b'/' {
                 return Some(i);
             }
         } else if prev.is_ascii_alphabetic()

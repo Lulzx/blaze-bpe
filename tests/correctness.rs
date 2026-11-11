@@ -23,6 +23,7 @@ fn edge_cases() -> Vec<String> {
         "foo.bar.baz", "a-b-c", "snake_case_name camelCaseName",
         "fn main() { println!(\"hi\"); }",
         "x += 1; // comment\nlet y = &mut *ptr;",
+        "//\n//", "/\n/", "}\n/", "a = b; //\n// next", ";\r\n/\n/x",
         "https://example.com/path?q=1&r=2#frag",
         "email@test.co.nz, \"quoted\" and 'single'",
         "日本語のテキスト",
@@ -160,6 +161,9 @@ fn chunked_parallel_matches_sequential() {
     let one_line = "{\"key\": \"value\", \"n\": 42, \"list\": [1, 2, 3]} ".repeat(20_000);
     let cjk = "日本語のテキスト、中文文本。改行なしで長い行を作る。".repeat(10_000);
     let mixed = format!("{shakespeare}\n\n{one_line}\n{cjk}\nend 'twas  \n it's");
+    // Every `\n` followed by non-whitespace here is inside an o200k punct
+    // piece (` }\n//`, via its `[\r\n/]*` tail), so there is no safe cut.
+    let comments = "    }\n// end\n".repeat(50_000);
     for (tok, reference) in [
         (
             Tokenizer::cl100k_base("data/cl100k_base.tiktoken").unwrap(),
@@ -170,7 +174,7 @@ fn chunked_parallel_matches_sequential() {
             tiktoken_rs::o200k_base().unwrap(),
         ),
     ] {
-        for text in [&shakespeare, &one_line, &cjk, &mixed] {
+        for text in [&shakespeare, &one_line, &cjk, &mixed, &comments] {
             assert!(text.len() > 512 * 1024 || text == &shakespeare);
             let par = tok.encode(text);
             assert_eq!(par, tok.encode_sequential(text));
