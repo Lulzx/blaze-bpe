@@ -610,7 +610,8 @@ impl Tokenizer {
     /// The scan-for-min loop is O(n) per merge, O(n^2) per piece; a binary
     /// heap over candidate pairs makes it O(n log n). Entries are validated
     /// lazily on pop: a pair (rank, left, right) applies iff `right` still
-    /// immediately follows `left` and the pair still merges to `rank` —
+    /// immediately follows `left` (a node merged into its left neighbour has
+    /// no successor) and the pair still merges to `rank` —
     /// otherwise a fresher entry for the same position is (or was) in the
     /// heap. Ordering by (rank, position) reproduces tiktoken's
     /// leftmost-lowest-rank choice exactly.
@@ -641,6 +642,7 @@ impl Tokenizer {
             ids[l] = r;
             let nn = next[rt] as usize;
             next[l] = nn as u32;
+            next[rt] = u32::MAX; // `rt` is gone: entries that start at it are stale
             if nn < n {
                 prev[nn] = l as u32;
                 let nr = self.pair_rank(r, ids[nn]);
