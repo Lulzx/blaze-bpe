@@ -60,6 +60,7 @@ fn edge_cases() -> Vec<String> {
     // A long piece to exceed the cacheable length and stress the merge loop.
     v.push("a".repeat(200));
     v.push("ab".repeat(150));
+    v.push("x".repeat(126) + "dvd");
     v.push("supercalifragilisticexpialidociousantidisestablishmentarianism".repeat(3));
     v.push(" ".repeat(100) + "x");
     v.push("\n".repeat(50));
@@ -226,4 +227,23 @@ fn long_piece_cache_matches_tiktoken() {
         cases.push(w.repeat(3).repeat(4));
     }
     compare(&ours, &reference, &cases);
+}
+
+#[test]
+fn long_piece_merge_matches_tiktoken() {
+    // Random lowercase runs are single pieces above the 128-byte heap-merge
+    // threshold with many competing merges.
+    let mut rng = Rng(0x2545F4914F6CDD1D);
+    let cases: Vec<String> = (0..200)
+        .map(|_| {
+            let len = 129 + (rng.next() % 2000) as usize;
+            (0..len)
+                .map(|_| (b'a' + (rng.next() % 26) as u8) as char)
+                .collect()
+        })
+        .collect();
+    let cl = Tokenizer::cl100k_base("data/cl100k_base.tiktoken").unwrap();
+    compare(&cl, &tiktoken_rs::cl100k_base().unwrap(), &cases);
+    let o2 = Tokenizer::o200k_base("data/o200k_base.tiktoken").unwrap();
+    compare(&o2, &tiktoken_rs::o200k_base().unwrap(), &cases);
 }
